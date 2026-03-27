@@ -10,7 +10,7 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # 1. ตารางเก็บ "ความคิด" และการเปิดไม้
+    # 1. ตารางเก็บ "ความคิด" และการเปิดไม้ (เพิ่ม ts_distance)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS trade_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -20,6 +20,7 @@ def init_db():
             lot REAL,
             reason TEXT,
             price REAL,
+            ts_distance INTEGER,
             status TEXT DEFAULT 'open' -- 'open' หรือ 'closed'
         )
     ''')
@@ -39,20 +40,19 @@ def init_db():
     conn.commit()
     conn.close()
 
-def log_trade_decision(decision, strategy, lot, reason, price):
-    """บันทึกเหตุผลที่ AI เลือกเทรด พร้อมเวลาที่ละเอียดขึ้น"""
+def log_trade_decision(decision, strategy, lot, reason, price, ts_distance=400):
+    """บันทึกเหตุผลที่ AI เลือกเทรด พร้อมระยะ Trailing Stop"""
     if decision.lower() == 'wait':
         return None
         
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # เพิ่ม %f เพื่อเก็บ Microseconds กันการซ้ำในวินาทีเดียวกัน
     precise_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] 
     
     cursor.execute('''
-        INSERT INTO trade_logs (timestamp, decision, strategy, lot, reason, price, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (precise_time, decision, strategy, lot, reason, price, 'open'))
+        INSERT INTO trade_logs (timestamp, decision, strategy, lot, reason, price, ts_distance, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (precise_time, decision, strategy, lot, reason, price, ts_distance, 'open'))
     
     last_id = cursor.lastrowid
     conn.commit()
@@ -84,7 +84,6 @@ def get_recent_history(limit=5):
     """ดึงประวัติล่าสุดมาให้ AI อ่าน (The Learning Context)"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # ดึงข้อมูลจากทั้งสองตารางมาให้ AI วิเคราะห์ผลแพ้ชนะในอดีตด้วย
     cursor.execute('''
         SELECT l.decision, l.strategy, l.reason, l.status, r.profit
         FROM trade_logs l
@@ -101,11 +100,10 @@ def get_full_trade_history(limit=50):
     conn.row_factory = sqlite3.Row 
     cursor = conn.cursor()
     
-    # ใช้ LEFT JOIN เพื่อเอาค่า Profit มาโชว์ในตารางเดียว
     cursor.execute('''
         SELECT 
             l.id, l.timestamp, l.decision, l.strategy, l.lot, 
-            l.price, l.status, l.reason, r.profit
+            l.price, l.ts_distance, l.status, l.reason, r.profit
         FROM trade_logs l
         LEFT JOIN trade_results r ON l.id = r.trade_id
         ORDER BY l.id DESC 

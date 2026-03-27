@@ -44,7 +44,6 @@ def get_indicators(symbol="XAUUSD.iux", timeframe=mt5.TIMEFRAME_M5, n=600):
     }
 
 # --- 5. ฟังก์ชันส่งคำสั่งซื้อขาย (Open) ---
-# บอสครับ ผมเพิ่ม tp_dist และ sl_dist มารับค่าจากสภา AI แล้วนะครับ (Default ที่ 500 ถ้าสภาไม่ส่งมา)
 def place_order(action, lot=0.01, symbol="XAUUSD.iux", tp_dist=500, sl_dist=500):
     if not mt5.initialize():
         connect_mt5()
@@ -53,7 +52,6 @@ def place_order(action, lot=0.01, symbol="XAUUSD.iux", tp_dist=500, sl_dist=500)
     symbol_info = mt5.symbol_info(symbol)
     if tick is None or symbol_info is None: return None
 
-    # คำนวณระยะตามที่ AI สั่งมา
     if action.lower() == 'buy':
         price = tick['ask']
         sl = price - (sl_dist * symbol_info.point)
@@ -74,14 +72,12 @@ def place_order(action, lot=0.01, symbol="XAUUSD.iux", tp_dist=500, sl_dist=500)
         "sl": round(sl, 2),
         "tp": round(tp, 2),
         "magic": 123456,
-        "comment": "AI Council v3.5",
+        "comment": "AI Council v3.9.6",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_FOK, 
     }
     
     result = mt5.order_send(request)
-    
-    # Logic เดิมที่บอสชอบ: ถ้า FOK พลาด (10030) ให้ลอง RETURN ทันที
     if result.retcode == 10030:
         request["type_filling"] = mt5.ORDER_FILLING_RETURN
         result = mt5.order_send(request)
@@ -121,3 +117,40 @@ def close_position(symbol="XAUUSD.iux"):
             last_result = mt5.order_send(request)
             
     return last_result
+
+# --- 7. [แก้ไขแล้ว] ฟังก์ชันแก้ไข SL โดยรักษา TP เดิมไว้ ---
+def modify_sl(ticket, new_sl, symbol="XAUUSD.iux"):
+    """ส่งคำสั่งแก้ไข SL ของออเดอร์เดิม โดยดึง TP เดิมมาใส่ด้วยเพื่อไม่ให้ TP หาย"""
+    if not mt5.initialize():
+        connect_mt5()
+        
+    # 1. ดึงข้อมูลออเดอร์ปัจจุบันออกมาจาก Ticket
+    positions = mt5.positions_get(ticket=ticket)
+    if positions is None or len(positions) == 0:
+        print(f"❌ ไม่พบออเดอร์ Ticket: {ticket}")
+        return None
+    
+    current_tp = positions[0].tp  # <--- เก็บค่า TP เดิมไว้ตรงนี้
+
+    # 2. สร้างคำสั่งแก้ไขโดยใส่ทั้ง SL ใหม่ และ TP เดิม
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": symbol,
+        "position": ticket,
+        "sl": round(float(new_sl), 2),
+        "tp": round(float(current_tp), 2), # <--- บรรทัดนี้คือหัวใจสำคัญ! ส่ง TP เดิมกลับไป
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_FOK,
+    }
+    
+    result = mt5.order_send(request)
+    
+    # Logic เดิมของบอส: ถ้า FOK พลาด ให้ลองใช้ RETURN
+    if result.retcode == 10030:
+        request["type_filling"] = mt5.ORDER_FILLING_RETURN
+        result = mt5.order_send(request)
+        
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        print(f"❌ Modify Failed: {result.comment} (code: {result.retcode})")
+        
+    return result

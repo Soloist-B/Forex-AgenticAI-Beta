@@ -20,7 +20,7 @@ class TradingAgent:
             "Trend_Follower": "เน้นดู EMA 50 และเทรนด์จาก H1 วาง TP ให้กว้างกว่า SL เพื่อเอา Risk:Reward ที่คุ้มค่า",
             "Risk_Manager": "คุมความเสี่ยงตาม Balance ห้ามออก Lot เกินตัว และต้องอนุมัติระยะ SL ที่ไม่ทำให้พอร์ตเสียหายหนัก"
         }
-        print(f"🤖 AI Council v3.5 (Dynamic TP/SL Managed) Initialized")
+        print(f"🤖 AI Council v3.9.6 (Dynamic Trailing) Initialized")
 
     def _safe_json_decode(self, content):
         try:
@@ -31,10 +31,9 @@ class TradingAgent:
             return None
 
     def analyze_market(self):
-        """ประชุมสภา AI เพื่อเปิดไม้และกำหนด TP/SL เอง"""
+        """ประชุมสภา AI เพื่อเปิดไม้และกำหนด TP/SL/TS เอง"""
         global current_user_instruction
         try:
-            # 1. ดึงข้อมูลตลาด (M5 และ H1)
             price_data = get_gold_price()
             m5_indicators = get_indicators(timeframe=mt5.TIMEFRAME_M5)
             h1_indicators = get_indicators(timeframe=mt5.TIMEFRAME_H1)
@@ -42,7 +41,6 @@ class TradingAgent:
             account_info = mt5.account_info()
             balance = account_info.balance if account_info else 0
             
-            # 2. ดึงประวัติล่าสุด
             past_trades = get_recent_history(25)
             history_context = "\n".join([
                 f"- {t[0].upper()} ({t[1]}) ผลลัพธ์: {'กำไร' if (t[4] or 0) > 0 else 'ขาดทุน'} ${t[4] if t[4] else 0}" 
@@ -68,7 +66,8 @@ class TradingAgent:
             ภารกิจ:
             1. ตัดสินใจว่าจะ Buy, Sell หรือ Wait
             2. ถ้าเข้าเทรด ให้กำหนด Lot (0.01 - 0.05) 
-            3. **กำหนดระยะ TP และ SL เป็นจำนวน 'จุด (Points)'** โดยวิเคราะห์จากความผันผวนและ Indicators (เช่น 200-800 จุด)
+            3. กำหนดระยะ TP และ SL เป็นจำนวน 'จุด (Points)'
+            4. **กำหนดระยะ Trailing Stop (ts_distance) เป็นจำนวนจุด (200-600) เพื่อรันกำไร**
 
             ตอบเป็น JSON เท่านั้น:
             {{
@@ -77,6 +76,7 @@ class TradingAgent:
                 "lot": 0.01,
                 "tp_distance": 500,
                 "sl_distance": 300,
+                "ts_distance": 400,
                 "debate_summary": "สรุปการถกเถียง",
                 "reason": "เหตุผลสุดท้าย"
             }}
@@ -86,9 +86,9 @@ class TradingAgent:
             data = self._safe_json_decode(response['message']['content'])
             
             if not data:
-                return {"decision": "wait", "lot": 0.01, "tp_distance": 500, "sl_distance": 500}, "JSON Error"
-            final_reason = f"[{data.get('strategy')}] TP:{data.get('tp_distance')} SL:{data.get('sl_distance')} | {data.get('debate_summary')}"
+                return {"decision": "wait", "lot": 0.01, "tp_distance": 500, "sl_distance": 500, "ts_distance": 400}, "JSON Error"
             
+            final_reason = f"[{data.get('strategy')}] TS:{data.get('ts_distance')} | {data.get('debate_summary')}"
             return data, final_reason
         
         except Exception as e:
@@ -96,44 +96,37 @@ class TradingAgent:
             return {"decision": "wait", "lot": 0.01}, str(e)
 
     def check_to_close(self, current_trade_info):
-        """ประชุมสภาเพื่อพิจารณาปิดไม้ โดยเน้นความอดทนมากขึ้น"""
+        """ประชุมสภาเพื่อพิจารณาปิดไม้"""
         try:
             price_data = get_gold_price()
             m5_indicators = get_indicators(timeframe=mt5.TIMEFRAME_M5)
-            
             trade_type = current_trade_info['type']
             profit = current_trade_info['profit']
 
-            # ปรับ Prompt ให้สภาไม่ขี้ตกใจ
             prompt = f"""
             [ประชุมด่วน: พิจารณาถือครองออเดอร์]
-            ออเดอร์: {trade_type} XAUUSD 
-            กำไร/ขาดทุนปัจจุบัน: ${profit}
-            ตลาด (M5): ราคา {price_data['bid']}, RSI {m5_indicators['rsi']}, Trend {m5_indicators['trend']}
+            ออเดอร์: {trade_type} XAUUSD | กำไรปัจจุบัน: ${profit}
+            ตลาด (M5): RSI {m5_indicators['rsi']}, Trend {m5_indicators['trend']}
 
             ภารกิจสภา:
-            1. ห้ามสั่งปิด (close) เพียงเพราะติดลบเล็กน้อย เว้นแต่เทรนด์จะเปลี่ยนทิศทางชัดเจน
-            2. Scalper: ถ้ากำไรถึงเป้าสั้นๆ ให้เชียร์ปิด
-            3. Risk Manager: ถ้าขาดทุนใกล้จุด SL (300 จุด) หรือกราฟเสียทรงจริงค่อยสั่งปิด
-            4. หากสถานการณ์ยังปกติ ให้เลือก "hold" เพื่อรันกำไร
+            1. เรามีระบบ Trailing Stop คอยคุมอยู่แล้ว ห้ามสั่งปิดเพียงเพราะกลัว
+            2. หากสถานการณ์ยังปกติ ให้เลือก "hold" เพื่อรันกำไร
+            3. สั่งปิด (close) เฉพาะเมื่อสภาเห็นสัญญาณกลับตัวที่รุนแรงจริงๆ
 
             ตอบเป็น JSON เท่านั้น:
             {{
                 "action": "close" | "hold",
-                "reason": "อธิบายสั้นๆ ว่าทำไมถึงปิดหรือถือต่อ"
+                "reason": "อธิบายสั้นๆ"
             }}
             """
             response = ollama.chat(model=self.model_name, messages=[{'role': 'user', 'content': prompt}])
             data = self._safe_json_decode(response['message']['content'])
             
-            # เพิ่ม Logic ดัก: ถ้าติดลบน้อยกว่า $5 ห้ามปิด (ถ้าบอสอยากคุมเองอีกชั้น)
             if data and data.get('action') == 'close':
-                # ถ้ากำไรเป็นบวก หรือ ขาดทุนหนักจริงๆ ค่อยยอมให้ปิด
                 return True, data.get('reason')
             
             return False, "Hold"
         except:
             return False, "Error"
-        
-# Global Instance
+
 gold_agent = TradingAgent()

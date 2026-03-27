@@ -6,11 +6,11 @@ import uvicorn
 from contextlib import asynccontextmanager
 import datetime as dt
 
-# --- IMPORT ส่วนเดิม ---
+# --- IMPORT ---
 try:
     from services.mt5_service import (
         connect_mt5, get_gold_price, place_order, 
-        has_open_positions, get_indicators, close_position
+        has_open_positions, get_indicators, close_position, modify_sl
     )
     from engine.agent import gold_agent, set_instruction 
     from engine.db_manager import (
@@ -25,12 +25,12 @@ except ImportError as e:
 current_db_id = None
 is_processing = False 
 app_ready = False 
+TS_STEP_POINTS = 50 
 
 async def auto_trading_loop():
     global current_db_id, is_processing, app_ready
     
     while not app_ready:
-        print("⏳ [WAIT] รอ FastAPI Startup ให้เสร็จสิ้นก่อนเริ่ม Loop...")
         await asyncio.sleep(1)
         
     print("\n" + "="*50)
@@ -53,51 +53,65 @@ async def auto_trading_loop():
             
             if positions and len(positions) > 0:
                 p = positions[0]
-                print(f"📦 [HOLDING] พบไม้ค้างในพอร์ต: {('BUY' if p.type == 0 else 'SELL')} | Profit: {round(p.profit, 2)} USD")
+                print(f"📦 [HOLDING] พบไม้ค้าง: {('BUY' if p.type == 0 else 'SELL')} | Profit: {round(p.profit, 2)} USD | SL: {p.sl}")
                 
-                # กู้คืน ID จาก Ledger ถ้าหายไป
+                # Sync ID
                 if current_db_id is None:
-                    print("🔍 [SYNC] พยายามกู้คืน DB_ID จากประวัติการเทรด...")
+                    print("🔍 [SYNC] พยายามกู้คืน DB_ID...")
                     history = get_full_trade_history(5)
                     for log in history:
                         if log['status'] == 'open':
                             current_db_id = log['id']
-                            print(f"✅ [SYNC] พบ ID ที่สอดคล้องกัน: {current_db_id}")
+                            print(f"✅ [SYNC] พบ ID: {current_db_id}")
                             break
 
-                current_info = {
-                    "type": ("BUY" if p.type == 0 else "SELL"), 
-                    "price": p.price_open, 
-                    "profit": round(p.profit, 2),
-                    "symbol": "XAUUSD.iux"
-                }
+                # --- TRAILING STOP LOGIC ---
+                symbol_info = mt5.symbol_info(p.symbol)
+                tick = get_gold_price(p.symbol)
                 
-                # ให้ Agent ตัดสินใจว่าจะปิดไหม
+                my_ts_dist = 400 
+                full_history = get_full_trade_history(10)
+                for item in full_history:
+                    if item['id'] == current_db_id:
+                        my_ts_dist = item.get('ts_distance', 400)
+                        break
+
+                if tick and symbol_info:
+                    point = symbol_info.point
+                    if p.type == 0: # BUY
+                        new_sl = round(tick['bid'] - (my_ts_dist * point), 2)
+                        if new_sl > p.sl + (TS_STEP_POINTS * point):
+                            modify_sl(p.ticket, new_sl, p.symbol)
+                            print(f"📈 [TS-UP] ขยับ SL ตามราคาไปที่: {new_sl} (Dist: {my_ts_dist})")
+                    elif p.type == 1: # SELL
+                        new_sl = round(tick['ask'] + (my_ts_dist * point), 2)
+                        if p.sl == 0 or new_sl < p.sl - (TS_STEP_POINTS * point):
+                            modify_sl(p.ticket, new_sl, p.symbol)
+                            print(f"📉 [TS-DOWN] ขยับ SL ตามราคาไปที่: {new_sl} (Dist: {my_ts_dist})")
+                
+                # --- COUNCIL EXIT ANALYSIS ---
+                current_info = {"type": ("BUY" if p.type == 0 else "SELL"), "price": p.price_open, "profit": round(p.profit, 2), "symbol": "XAUUSD.iux"}
                 print("🧠 [COUNCIL] กำลังวิเคราะห์จังหวะ Exit...")
                 should_close, exit_reason = gold_agent.check_to_close(current_info)
                 
                 if should_close:
                     is_processing = True 
-                    print(f"🚨 [EXIT SIGNAL] สั่งปิดออเดอร์ทันที! เหตุผล: {exit_reason}")
+                    print(f"🚨 [EXIT SIGNAL] สั่งปิดออเดอร์! เหตุผล: {exit_reason}")
                     result = close_position("XAUUSD.iux")
                     if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                        print(f"💰 [CLOSED] ปิดสำเร็จ! ผลกำไร: {p.profit} USD")
+                        print(f"💰 [CLOSED] ปิดสำเร็จ! กำไร: {p.profit} USD")
                         log_trade_result(current_db_id, p.profit)
                         current_db_id = None
-                    else:
-                        print(f"❌ [ERROR] ปิดออเดอร์ไม่สำเร็จ Retcode: {result.retcode if result else 'No Result'}")
                     is_processing = False 
                 else:
                     print(f"💎 [HOLD] Council มติให้ถือต่อ (Profit: {round(p.profit, 2)})")
                 
-                print("💤 [SLEEP] พัก 60 วินาทีตามรอบ Monitoring...")
-                await asyncio.sleep(60)
+                await asyncio.sleep(15)
             
             # --- STEP 2: ANALYZE NEW TRADE ---
             else:
-                # Sync Ledger กรณีไม้ปิดไปเอง (SL/TP)
                 if current_db_id is not None:
-                    print(f"⚠️ [SYNC] ไม้ ID {current_db_id} หายจากพอร์ต (อาจชน SL/TP)")
+                    print(f"⚠️ [SYNC] ไม้ ID {current_db_id} หายไป (ชน SL/TP)")
                     from_date = dt.datetime.now() - dt.timedelta(minutes=15)
                     deals = mt5.history_deals_get(from_date, dt.datetime.now())
                     actual_profit = 0.0
@@ -106,79 +120,61 @@ async def auto_trading_loop():
                             if deal.symbol == "XAUUSD.iux" and deal.entry == 1:
                                 actual_profit = deal.profit
                                 break
-                    print(f"📝 [UPDATE] บันทึกผลกำไรลง Ledger: {actual_profit}")
                     log_trade_result(current_db_id, actual_profit)
                     current_db_id = None
 
-                print("🔭 [SCAN] พอร์ตว่าง... เริ่มต้นการประชุม Council เพื่อวิเคราะห์ตลาด")
+                print("🔭 [SCAN] พอร์ตว่าง... เริ่มประชุมสภา AI")
                 is_processing = True 
                 
-                # รับ Data และคำตัดสิน
+                indicators = get_indicators()
+                print(f"📊 [MARKET DATA] Indicators: {indicators}")
+                
                 decision_data, reason = gold_agent.analyze_market()
                 decision = decision_data.get('decision', 'wait').lower()
-                
-                print(f"📊 [MARKET DATA] Indicators: {get_indicators()}")
                 print(f"🧐 [COUNCIL REASONING] {reason}")
 
                 if decision in ['buy', 'sell']:
                     # Final Guard
-                    re_pos = mt5.positions_get(symbol="XAUUSD.iux")
-                    if re_pos:
-                        print("🚫 [PROTECT] ตลาดเปลี่ยนไวกว่าที่คิด! พบไม้เปิดอยู่แล้ว ยกเลิกคำสั่งซ้ำ")
+                    if mt5.positions_get(symbol="XAUUSD.iux"):
+                        print("🚫 [PROTECT] พบไม้เปิดอยู่แล้ว ยกเลิก")
                         is_processing = False
                         continue
 
                     lot = float(decision_data.get('lot', 0.01))
-                    print(f"🔥 [EXECUTE] มติเป็นเอกฉันท์: {decision.upper()} | Lot: {lot}")
+                    ts_dist = int(decision_data.get('ts_distance', 400))
+                    print(f"🔥 [EXECUTE] มติเอกฉันท์: {decision.upper()} | Lot: {lot} | TS: {ts_dist}")
                     
-                    res = place_order(
-                        decision, 
-                        lot=lot, 
-                        tp_dist=int(decision_data.get('tp_distance', 500)), 
-                        sl_dist=int(decision_data.get('sl_distance', 300))
-                    )
+                    res = place_order(decision, lot=lot, tp_dist=int(decision_data.get('tp_distance', 500)), sl_dist=int(decision_data.get('sl_distance', 300)))
                     
                     if res and res.retcode == mt5.TRADE_RETCODE_DONE:
                         price_now = get_gold_price()['bid']
-                        current_db_id = log_trade_decision(
-                            decision, 
-                            decision_data.get('strategy', 'Scalper'), 
-                            lot, reason, price_now
-                        )
-                        print(f"🚀 [SUCCESS] เปิดไม้สำเร็จ! Ledger ID: {current_db_id} ที่ราคา {price_now}")
-                        await asyncio.sleep(5)
-                    else:
-                        print(f"❌ [FAILED] การเปิด Order ผิดพลาด: {res.comment if res else 'Unknown Error'}")
+                        current_db_id = log_trade_decision(decision, decision_data.get('strategy'), lot, reason, price_now, ts_distance=ts_dist)
+                        print(f"🚀 [SUCCESS] เปิดไม้สำเร็จ! Ledger ID: {current_db_id} ที่ {price_now}")
                 else:
-                    print(f"😴 [WAIT] Council มติให้ 'รอดูสถานการณ์' (Wait)")
-
+                    print("😴 [WAIT] สภามติให้รอดูสถานการณ์")
+                
                 is_processing = False 
-                print("💤 [SLEEP] พัก 60 วินาทีเพื่อเริ่มประชุมรอบถัดไป...")
+                print("💤 [SLEEP] พัก 60 วินาที...")
                 await asyncio.sleep(60)
 
         except Exception as e:
-            print(f"🚨 [LOOP ERROR] เกิดข้อผิดพลาดไม่คาดคิด: {str(e)}")
+            print(f"🚨 [LOOP ERROR]: {e}")
             is_processing = False
             await asyncio.sleep(10)
 
-# --- 3. LIFESPAN MANAGEMENT ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global app_ready
-    print("🚀 [SYSTEM] กำลังเตรียมการ Startup...")
+    print("🚀 [SYSTEM] Starting Startup...")
     if connect_mt5():
-        print("✅ [SYSTEM] MT5 เชื่อมต่อสำเร็จ")
         asyncio.create_task(auto_trading_loop())
-    
     app_ready = True
     yield 
-    print("🛑 [SHUTDOWN] กำลังปิดระบบและตัดการเชื่อมต่อ...")
     mt5.shutdown()
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# --- ENDPOINTS ---
 @app.get("/api/status")
 def get_status():
     try:
@@ -187,14 +183,8 @@ def get_status():
         pos = mt5.positions_get(symbol="XAUUSD.iux")
         current_trade = {"type": ("BUY" if pos[0].type == 0 else "SELL"), "price": pos[0].price_open, "profit": round(pos[0].profit, 2)} if pos else None
         return {
-            "price": price_data['bid'], 
-            "balance": acc.balance, 
-            "equity": acc.equity, 
-            "profit_total": acc.profit, 
-            "current_trade": current_trade, 
-            "indicators": get_indicators(), 
-            "status": "AI v3.9.6 Active",
-            "is_processing": is_processing
+            "price": price_data['bid'], "balance": acc.balance, "equity": acc.equity, 
+            "current_trade": current_trade, "indicators": get_indicators(), "status": "AI v3.9.6 Active"
         }
     except: return {"status": "Offline"}
 
